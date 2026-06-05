@@ -119,6 +119,9 @@ encode_cols = [c for c in df_base.columns if not pd.api.types.is_numeric_dtype(d
 for col in encode_cols:
     df_base[col] = LabelEncoder().fit_transform(df_base[col].fillna("Missing").astype(str))
 
+
+print("Final number of Patients: ")
+print(len(df_base))
 # ==========================================
 # 3. ISOLATE, SPLIT, AND LOCK THE COHORTS
 # ==========================================

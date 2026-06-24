@@ -5,7 +5,7 @@ import numpy as np
 # Import functions to split data and tune hyperparameters randomly
 from sklearn.model_selection import train_test_split, RandomizedSearchCV
 # Import scoring metrics to evaluate the model's performance
-from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.metrics import confusion_matrix
 # Import LabelEncoder to turn text categories (like 'Positive') into numbers (like 1)
 from sklearn.preprocessing import LabelEncoder
 # Import the core XGBoost algorithm
@@ -17,7 +17,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 1. LOAD DATA & GOLDEN COHORT FILTER
 # ==========================================
-filename = "INPUT/SEER_10436_in_situ_included.csv"
+filename = "INPUT/SEER_11760_alive_and_in_situ_included.csv"
+#filename = "INPUT/SEER_556_alive_in_situ_refused.csv"
+
 print(f"Loading {filename}...")
 df = pd.read_csv(filename, low_memory=False)
 
@@ -26,6 +28,7 @@ df['Year of diagnosis'] = pd.to_numeric(df['Year of diagnosis'], errors='coerce'
 
 # VITAL FILTER 1 & 2: Active survival > 0 and exclude post-mortem diagnoses
 df = df[df['Survival months'] > 0] 
+
 if 'Type of Reporting Source' in df.columns:
     autopsy_mask = df['Type of Reporting Source'].astype(str).str.contains('autopsy|death certificate', case=False, na=False)
     df = df[~autopsy_mask]
@@ -105,7 +108,9 @@ protected_cols = [
     'ER Status Recode Breast Cancer (1990+)', 'PR Status Recode Breast Cancer (1990+)',
     'Has_Previous_History', 'Age_Stage_Interaction', 'Age_Tumor_Size_Interaction', 
     'COD to site recode', 'Survival months',
-    'Histology recode - broad groupings', 'Site recode - rare tumors'
+    'Histology recode - broad groupings', 'Site recode - rare tumors',
+    'Marital status at diagnosis', 'Median household income inflation adj to 2023',
+    'Primary Site', 'Laterality', 'Race recode (White, Black, Other)'
 ]
 
 df_base = df_base[[c for c in protected_cols if c != 'Target' and c in df_base.columns]]
@@ -119,9 +124,9 @@ encode_cols = [c for c in df_base.columns if not pd.api.types.is_numeric_dtype(d
 for col in encode_cols:
     df_base[col] = LabelEncoder().fit_transform(df_base[col].fillna("Missing").astype(str))
 
-
 print("Final number of Patients: ")
 print(len(df_base))
+
 # ==========================================
 # 3. ISOLATE, SPLIT, AND LOCK THE COHORTS
 # ==========================================
@@ -144,16 +149,28 @@ print(f"Locked EXTENDED Aggressive Pool (>= 5 yrs): Ready for incremental 'unloc
 
 
 # ==========================================
-# 4. TEMPORAL EXPERT MODELS (ALL THRESHOLDS)
+# 4. TEMPORAL EXPERT MODELS & METRICS CALCULATION
 # ==========================================
 thresholds_yrs = [5, 6, 7, 8, 9, 10]
-optimal_ratios = []
+all_metrics = []
+
+# --- BOUNDARY CONSTRAINT ---
+# Require the model to correctly identify at least 50% of the Aggressive tumors 
+# to prevent the "predict everyone is indolent" trivial solution.
+MIN_SPECIFICITY_FOR_INDOLENCE = 0.50 
+
+def compute_metrics(tn, fp, fn, tp):
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    f1 = 2 * (precision * sensitivity) / (precision + sensitivity) if (precision + sensitivity) > 0 else 0
+    return sensitivity, specificity, precision, f1
 
 for yrs in thresholds_yrs:
     thresh_mos = yrs * 12 
     
     print("\n" + "="*80)
-    print(f"   TRAINING & OPTIMIZING EXPERT MODEL: {yrs}-YEAR THRESHOLD   ")
+    print(f"   EVALUATING 3 STRATEGIES FOR {yrs}-YEAR THRESHOLD   ")
     print("="*80)
     
     # Assemble current cohorts
@@ -190,11 +207,9 @@ for yrs in thresholds_yrs:
     y_probs = best_xgb.predict_proba(X_test)[:, 1]
 
     # ---------------------------------------------------------
-    # ADVISOR TEST: SLIDING SCALE (100:0 down to 0:100, step 1)
+    # RUN SLIDING SCALE OPIMIZATION
     # ---------------------------------------------------------
-    print(f"[!] Running Sliding Scale Optimization for {yrs}-Year Threshold...")
     results_list = []
-
     for w_fp in range(100, -1, -1):
         w_fn = 100 - w_fp
         best_thresh = 0.50
@@ -208,7 +223,6 @@ for yrs in thresholds_yrs:
             if cm_temp.shape == (2, 2):
                 tn, fp, fn, tp = cm_temp.ravel()
                 cost = (fp * w_fp) + (fn * w_fn)
-                
                 if cost < min_cost:
                     min_cost = cost
                     best_thresh = thresh
@@ -216,72 +230,76 @@ for yrs in thresholds_yrs:
                     
         if best_cm:
             tn, fp, fn, tp = best_cm
-            results_list.append({
-                'FP_Cost': w_fp,
-                'FN_Cost': w_fn,
-                'Best_Thresh': best_thresh,
-                'FP': fp,
-                'FN': fn
-            })
+            spec = tn / (tn + fp) if (tn + fp) > 0 else 0
+            results_list.append({'FP_Cost': w_fp, 'FN_Cost': w_fn, 'Best_Thresh': best_thresh, 'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp, 'Spec': spec})
 
     df_spectrum = pd.DataFrame(results_list)
     
     # ---------------------------------------------------------
-    # EXTRACT THE OPTIMAL "ZERO FP" RATIO & CONFUSION MATRIX
+    # STRATEGY 1: MAX CLINICAL SAFETY (FP = 0)
     # ---------------------------------------------------------
-    # Filter for scenarios where patient safety is perfect (FP == 0)
     df_safe = df_spectrum[df_spectrum['FP'] == 0]
-    
     if not df_safe.empty:
-        # Sort to find the absolute lowest FP penalty (most lenient) that still yields 0 FP
         best_safe = df_safe.sort_values(by=['FN', 'FP_Cost'], ascending=[True, True]).iloc[0]
-        
-        fp_weight = int(best_safe['FP_Cost'])
-        fn_weight = int(best_safe['FN_Cost'])
-        min_fn = int(best_safe['FN'])
-        optimal_thresh = best_safe['Best_Thresh']
-        
-        # Calculate the simplified X-to-1 ratio
-        ratio = fp_weight / fn_weight if fn_weight > 0 else float('inf')
-        
-        print("\n" + "-"*50)
-        print(f"★ OPTIMAL SAFETY POINT FOUND ({yrs}-YEAR) ★")
-        print(f"Lowest penalty yielding 0 missed aggressive cases:")
-        print(f"Weight Split: {fp_weight} (FP) to {fn_weight} (FN)")
-        print(f"Cost Ratio Equivalent: {ratio:.1f}-to-1")
-        print(f"Resulting Errors: {0} FP, {min_fn} FN")
-        
-        # Print the fully realized Confusion Matrix for this specific optimal threshold
-        y_pred_optimal = (y_probs >= optimal_thresh).astype(int)
-        cm_optimal = confusion_matrix(y_test, y_pred_optimal)
-        print("\n[Optimal Confusion Matrix]")
-        print(pd.DataFrame(cm_optimal, 
-                             index=['Actual Aggressive', 'Actual Overdiagnosis'], 
-                             columns=['Pred Aggressive', 'Pred Overdiagnosis']))
-        print("-" * 50)
-        
-        optimal_ratios.append({
-            'Threshold (Years)': yrs,
-            'Optimal FP Cost': fp_weight,
-            'Optimal FN Cost': fn_weight,
-            'Equivalent Ratio': f"{ratio:.1f}:1",
-            'Missed OD (FN)': min_fn
+        tn, fp, fn, tp = int(best_safe['TN']), int(best_safe['FP']), int(best_safe['FN']), int(best_safe['TP'])
+        sens, spec, prec, f1 = compute_metrics(tn, fp, fn, tp)
+        all_metrics.append({
+            'Threshold': f"{yrs} Years", 'Strategy': f"Max Clinical Safety ({int(best_safe['FP_Cost'])}:{int(best_safe['FN_Cost'])})",
+            'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp, 'Sens': sens, 'Spec': spec, 'Prec': prec, 'F1': f1
+        })
+    
+    # ---------------------------------------------------------
+    # STRATEGY 2: 1-TO-1 BALANCED COST (50:50)
+    # ---------------------------------------------------------
+    df_bal = df_spectrum[df_spectrum['FP_Cost'] == 50]
+    if not df_bal.empty:
+        best_bal = df_bal.iloc[0]
+        tn, fp, fn, tp = int(best_bal['TN']), int(best_bal['FP']), int(best_bal['FN']), int(best_bal['TP'])
+        sens, spec, prec, f1 = compute_metrics(tn, fp, fn, tp)
+        all_metrics.append({
+            'Threshold': f"{yrs} Years", 'Strategy': "1-to-1 Balanced Cost (50:50)",
+            'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp, 'Sens': sens, 'Spec': spec, 'Prec': prec, 'F1': f1
+        })
+
+    # ---------------------------------------------------------
+    # STRATEGY 3: MAX INDOLENCE DETECTION (Bounded)
+    # ---------------------------------------------------------
+    # Filter to only include rows where Specificity >= MIN_SPECIFICITY_FOR_INDOLENCE
+    df_bounded = df_spectrum[df_spectrum['Spec'] >= MIN_SPECIFICITY_FOR_INDOLENCE]
+    
+    if not df_bounded.empty:
+        # Sort to find the lowest FN within the allowed Specificity boundary
+        best_ind = df_bounded.sort_values(by=['FN', 'FN_Cost'], ascending=[True, True]).iloc[0]
+        tn, fp, fn, tp = int(best_ind['TN']), int(best_ind['FP']), int(best_ind['FN']), int(best_ind['TP'])
+        sens, spec, prec, f1 = compute_metrics(tn, fp, fn, tp)
+        all_metrics.append({
+            'Threshold': f"{yrs} Years", 'Strategy': f"Max Indolence (Bounded {int(best_ind['FP_Cost'])}:{int(best_ind['FN_Cost'])})",
+            'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp, 'Sens': sens, 'Spec': spec, 'Prec': prec, 'F1': f1
         })
     else:
-        print("\n[!] WARNING: Could not achieve 0 False Positives at this threshold, even at 100:0 cost.")
-        optimal_ratios.append({
-            'Threshold (Years)': yrs,
-            'Optimal FP Cost': 'N/A',
-            'Optimal FN Cost': 'N/A',
-            'Equivalent Ratio': 'Safety Failed',
-            'Missed OD (FN)': 'N/A'
+        # Fallback if impossible
+        best_ind = df_spectrum.sort_values(by=['FN']).iloc[0]
+        tn, fp, fn, tp = int(best_ind['TN']), int(best_ind['FP']), int(best_ind['FN']), int(best_ind['TP'])
+        sens, spec, prec, f1 = compute_metrics(tn, fp, fn, tp)
+        all_metrics.append({
+            'Threshold': f"{yrs} Years", 'Strategy': f"Max Indolence (Best Effort {int(best_ind['FP_Cost'])}:{int(best_ind['FN_Cost'])})",
+            'TN': tn, 'FP': fp, 'FN': fn, 'TP': tp, 'Sens': sens, 'Spec': spec, 'Prec': prec, 'F1': f1
         })
 
 # ==========================================
-# 5. FINAL SUMMARY REPORT
+# 5. FINAL EXPORT FOR LATEX TABLE
 # ==========================================
-print("\n" + "="*80)
-print("   FINAL OPTIMIZATION SUMMARY ACROSS ALL THRESHOLDS   ")
-print("="*80)
-summary_df = pd.DataFrame(optimal_ratios)
-print(summary_df.to_string(index=False))
+print("\n" + "="*110)
+print("   FINAL METRICS TABLE FOR ALL STRATEGIES & THRESHOLDS   ")
+print("="*110)
+df_final_metrics = pd.DataFrame(all_metrics)
+
+# Formatting to match the desired LaTeX table output
+pd.set_option('display.max_columns', None)
+pd.set_option('display.width', 1000)
+df_final_metrics['Sens'] = df_final_metrics['Sens'].apply(lambda x: f"{x:.2f}")
+df_final_metrics['Spec'] = df_final_metrics['Spec'].apply(lambda x: f"{x:.2f}")
+df_final_metrics['Prec'] = df_final_metrics['Prec'].apply(lambda x: f"{x:.2f}")
+df_final_metrics['F1'] = df_final_metrics['F1'].apply(lambda x: f"{x:.2f}")
+
+print(df_final_metrics.to_string(index=False))

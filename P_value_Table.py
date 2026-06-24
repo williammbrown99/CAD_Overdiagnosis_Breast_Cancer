@@ -7,7 +7,8 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 1. LOAD DATA & BASE CLEANING
 # ==========================================
-filename = "INPUT/SEER_10436_in_situ_included.csv"
+# UPDATED: Pointing to the final alive-included dataset
+filename = "INPUT/SEER_11760_alive_and_in_situ_included.csv"
 print(f"Loading {filename} for Baseline Characteristics...\n")
 df = pd.read_csv(filename, low_memory=False)
 
@@ -81,13 +82,13 @@ for col in ['ER Status Recode Breast Cancer (1990+)', 'PR Status Recode Breast C
 # ==========================================
 # 3. AUTOMATED LOOP FOR TABLE 1 GENERATION
 # ==========================================
-# UPDATED: Evaluate the full 5-to-10 year continuum
+# Evaluate the full 5-to-10 year continuum
 thresholds_yrs = [5, 6, 7, 8, 9, 10]
 
 for yrs in thresholds_yrs:
     thresh_mos = yrs * 12
 
-    # UPDATED: The Aggressive class (< thresh_mos) now scales cumulatively with the Overdiagnosed class
+    # The Aggressive class (< thresh_mos) now explicitly scales cumulatively with the Overdiagnosed class (>= thresh_mos, != Breast)
     cond_1 = (df_base['COD to site recode'] != 'Breast') & (df_base['Survival months'] >= thresh_mos)
     cond_0 = (df_base['COD to site recode'] == 'Breast') & (df_base['Survival months'] < thresh_mos)
 
@@ -164,4 +165,13 @@ for yrs in thresholds_yrs:
         print_categorical("PR Status", "PR Status Recode Breast Cancer (1990+)")
         
     print_categorical("Previous Cancer History", "Has_Previous_History")
+    
+    # NEW: Print the newly added features for your demographic/baseline table
+    if 'Race recode (White, Black, Other)' in df_run.columns:
+        print_categorical("Race", "Race recode (White, Black, Other)")
+    if 'Primary Site' in df_run.columns:
+        print_categorical("Primary Site", "Primary Site")
+    if 'Laterality' in df_run.columns:
+        print_categorical("Laterality", "Laterality")
+        
     print("-" * 95)

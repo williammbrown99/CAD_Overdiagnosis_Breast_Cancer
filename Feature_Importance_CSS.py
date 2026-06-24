@@ -20,7 +20,9 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 1. LOAD DATA & GOLDEN COHORT FILTER
 # ==========================================
-filename = "INPUT/SEER_10436_in_situ_included.csv"
+# Updated to the final dataset including living patients and in-situ cases
+filename = "INPUT/SEER_11760_alive_and_in_situ_included.csv"
+
 print(f"Loading {filename}...")
 df = pd.read_csv(filename, low_memory=False)
 
@@ -29,6 +31,7 @@ df['Year of diagnosis'] = pd.to_numeric(df['Year of diagnosis'], errors='coerce'
 
 # VITAL FILTER 1 & 2: Active survival > 0 and exclude post-mortem diagnoses
 df = df[df['Survival months'] > 0] 
+
 if 'Type of Reporting Source' in df.columns:
     autopsy_mask = df['Type of Reporting Source'].astype(str).str.contains('autopsy|death certificate', case=False, na=False)
     df = df[~autopsy_mask]
@@ -102,13 +105,15 @@ if 'Sequence number' in df_base.columns:
 else:
     df_base['Has_Previous_History'] = 0
 
-# THE FIREWALL: Whitelist
+# THE FIREWALL: Whitelist (Updated with Race, Primary Site, Laterality)
 protected_cols = [
     'Target', 'Age_Numeric', 'Master_Tumor_Size', 'Master_Grade', 'Master_Stage', 
     'ER Status Recode Breast Cancer (1990+)', 'PR Status Recode Breast Cancer (1990+)',
     'Has_Previous_History', 'Age_Stage_Interaction', 'Age_Tumor_Size_Interaction', 
     'COD to site recode', 'Survival months',
-    'Histology recode - broad groupings', 'Site recode - rare tumors'
+    'Histology recode - broad groupings', 'Site recode - rare tumors',
+    'Marital status at diagnosis', 'Median household income inflation adj to 2023',
+    'Primary Site', 'Laterality', 'Race recode (White, Black, Other)'
 ]
 
 df_base = df_base[[c for c in protected_cols if c != 'Target' and c in df_base.columns]]
@@ -121,6 +126,10 @@ for col in ['ER Status Recode Breast Cancer (1990+)', 'PR Status Recode Breast C
 encode_cols = [c for c in df_base.columns if not pd.api.types.is_numeric_dtype(df_base[c]) and c not in ['COD to site recode']]
 for col in encode_cols:
     df_base[col] = LabelEncoder().fit_transform(df_base[col].fillna("Missing").astype(str))
+
+
+print("Final number of Patients: ")
+print(len(df_base))
 
 # ==========================================
 # 3. ISOLATE, SPLIT, AND LOCK THE COHORTS
@@ -232,9 +241,11 @@ for yrs in thresholds_yrs:
     # ---------------------------------------------------------
     # EXTRACT THE OPTIMAL "ZERO FP" RATIO & CONFUSION MATRIX
     # ---------------------------------------------------------
+    # Filter for scenarios where patient safety is perfect (FP == 0)
     df_safe = df_spectrum[df_spectrum['FP'] == 0]
     
     if not df_safe.empty:
+        # Sort to find the absolute lowest FP penalty (most lenient) that still yields 0 FP
         best_safe = df_safe.sort_values(by=['FN', 'FP_Cost'], ascending=[True, True]).iloc[0]
         
         fp_weight = int(best_safe['FP_Cost'])
@@ -242,12 +253,15 @@ for yrs in thresholds_yrs:
         min_fn = int(best_safe['FN'])
         optimal_thresh = best_safe['Best_Thresh']
         
+        # Calculate the simplified X-to-1 ratio
         ratio = fp_weight / fn_weight if fn_weight > 0 else float('inf')
         
         print("\n" + "-"*50)
         print(f"★ OPTIMAL SAFETY POINT FOUND ({yrs}-YEAR) ★")
+        print(f"Lowest penalty yielding 0 missed aggressive cases:")
         print(f"Weight Split: {fp_weight} (FP) to {fn_weight} (FN)")
         print(f"Cost Ratio Equivalent: {ratio:.1f}-to-1")
+        print(f"Resulting Errors: {0} FP, {min_fn} FN")
         
         # Apply the mathematically perfect threshold to the evaluation dataframe
         y_pred_optimal = (y_probs >= optimal_thresh).astype(int)
@@ -289,7 +303,10 @@ for yrs in thresholds_yrs:
         rename_dict = {
             'Master_Grade': 'Tumor Grade',
             'Master_Tumor_Size': 'Tumor Size',
-            'Age_Numeric': 'Age'
+            'Age_Numeric': 'Age',
+            'Race recode (White, Black, Other)': 'Race',
+            'Primary Site': 'Primary Tumor Site',
+            'Laterality': 'Tumor Laterality'
         }
         
         clean_labels = []
@@ -336,7 +353,7 @@ for yrs in thresholds_yrs:
             plt.title(f'Cancer-Specific Survival (CSS) Validation at {yrs}-Year Threshold', fontsize=14, fontweight='bold')
             plt.xlabel('Years since Diagnosis', fontsize=12)
             plt.ylabel('Probability of Cancer-Specific Survival', fontsize=12)
-            plt.xlim(0, 10)  # <-- X-AXIS UPDATED TO 10
+            plt.xlim(0, 10)
             plt.ylim(0, 1.05)
             plt.grid(True, alpha=0.3)
             plt.text(0.5, 0.1, f'Log-Rank p-value: {results.p_value:.2e}', fontsize=12, bbox=dict(facecolor='white', alpha=0.8, edgecolor='gray'))
@@ -363,3 +380,26 @@ print("   FINAL OPTIMIZATION SUMMARY ACROSS ALL THRESHOLDS   ")
 print("="*80)
 summary_df = pd.DataFrame(optimal_ratios)
 print(summary_df.to_string(index=False))
+
+# ==========================================
+# EXACT COHORT SIZES FOR LATEX TABLE
+# ==========================================
+print("\n" + "="*80)
+print(" EXACT COHORT DISTRIBUTIONS FOR LATEX TABLE ")
+print("="*80)
+
+for yrs in [5, 6, 7, 8, 9, 10]:
+    thresh_mos = yrs * 12
+    
+    # Calculate exact sizes from df_base
+    agg_len = len(df_base[(df_base['COD to site recode'] == 'Breast') & (df_base['Survival months'] < thresh_mos)])
+    ind_len = len(df_base[(df_base['COD to site recode'] != 'Breast') & (df_base['Survival months'] >= thresh_mos)])
+    tot_len = agg_len + ind_len
+    
+    agg_pct = (agg_len / tot_len) * 100
+    ind_pct = (ind_len / tot_len) * 100
+    
+    print(f"{yrs}-Year Threshold:")
+    print(f"Total: {tot_len:,}")
+    print(f"  • Aggressive: {agg_len:,} ({agg_pct:.1f}%)")
+    print(f"  • Indolent:   {ind_len:,} ({ind_pct:.1f}%)\n")

@@ -19,7 +19,7 @@ warnings.filterwarnings('ignore')
 # ==========================================
 # 1. LOAD DATA & GOLDEN COHORT FILTER
 # ==========================================
-filename = "INPUT/SEER_10436_in_situ_included.csv"
+filename = "INPUT/SEER_11760_alive_and_in_situ_included.csv"
 print(f"Loading {filename}...")
 df = pd.read_csv(filename, low_memory=False)
 
@@ -101,13 +101,15 @@ if 'Sequence number' in df_base.columns:
 else:
     df_base['Has_Previous_History'] = 0
 
-# THE FIREWALL: Whitelist
+# THE FIREWALL: Whitelist (Updated with Latest Features)
 protected_cols = [
     'Target', 'Age_Numeric', 'Master_Tumor_Size', 'Master_Grade', 'Master_Stage', 
     'ER Status Recode Breast Cancer (1990+)', 'PR Status Recode Breast Cancer (1990+)',
     'Has_Previous_History', 'Age_Stage_Interaction', 'Age_Tumor_Size_Interaction', 
     'COD to site recode', 'Survival months',
-    'Histology recode - broad groupings', 'Site recode - rare tumors'
+    'Histology recode - broad groupings', 'Site recode - rare tumors',
+    'Marital status at diagnosis', 'Median household income inflation adj to 2023',
+    'Primary Site', 'Laterality', 'Race recode (White, Black, Other)'
 ]
 
 df_base = df_base[[c for c in protected_cols if c != 'Target' and c in df_base.columns]]
@@ -144,12 +146,16 @@ train_ext_agg, test_ext_agg = train_test_split(df_ext_agg, test_size=0.2, random
 print(f"Locked BASE Aggressive Test Set (< 5 yrs): {len(test_base_agg)} patients (The Original 494)")
 print(f"Locked EXTENDED Aggressive Pool (>= 5 yrs): Ready for incremental 'unlocking'.")
 
+
 # ==========================================
 # 4. TEMPORAL EXPERT MODELS (ALL THRESHOLDS)
 # ==========================================
 thresholds_yrs = [5, 6, 7, 8, 9, 10]
 optimal_ratios = []
 kmf_aggressive_dict = {}
+
+# Master list to hold all raw data for the single CSV export
+master_raw_data = []
 
 for yrs in thresholds_yrs:
     thresh_mos = yrs * 12 
@@ -221,14 +227,28 @@ for yrs in thresholds_yrs:
                     
         if best_cm:
             tn, fp, fn, tp = best_cm
+            
+            # Calculate required rates and ratios for raw data export
+            fp_rate = fp / (fp + tn) if (fp + tn) > 0 else 0.0
+            fn_rate = fn / (fn + tp) if (fn + tp) > 0 else 0.0
+            cost_ratio = w_fp / w_fn if w_fn > 0 else float('inf')
+            fp_to_fn_ratio = fp / fn if fn > 0 else float('inf')
+            
             results_list.append({
+                'Threshold_Years': yrs,
                 'FP_Cost': w_fp,
                 'FN_Cost': w_fn,
+                'Cost_Ratio': cost_ratio,
                 'Best_Thresh': best_thresh,
                 'FP': fp,
-                'FN': fn
+                'FN': fn,
+                'FP_Rate': fp_rate,
+                'FN_Rate': fn_rate,
+                'Error_Ratio_FP_to_FN': fp_to_fn_ratio
             })
 
+    # Append this threshold's results to the master list
+    master_raw_data.extend(results_list)
     df_spectrum = pd.DataFrame(results_list)
     
     # ---------------------------------------------------------
@@ -245,6 +265,13 @@ for yrs in thresholds_yrs:
         optimal_thresh = best_safe['Best_Thresh']
         
         ratio = fp_weight / fn_weight if fn_weight > 0 else float('inf')
+        
+        print("\n" + "-"*50)
+        print(f"★ OPTIMAL SAFETY POINT FOUND ({yrs}-YEAR) ★")
+        print(f"Lowest penalty yielding 0 missed aggressive cases:")
+        print(f"Weight Split: {fp_weight} (FP) to {fn_weight} (FN)")
+        print(f"Cost Ratio Equivalent: {ratio:.1f}-to-1")
+        print(f"Resulting Errors: {0} FP, {min_fn} FN")
         
         optimal_ratios.append({
             'Threshold (Years)': yrs,
@@ -302,13 +329,19 @@ for yrs in thresholds_yrs:
         })
 
 # ==========================================
-# 5. FINAL SUMMARY REPORT
+# 5. FINAL SUMMARY REPORT & MASTER CSV EXPORT
 # ==========================================
 print("\n" + "="*80)
 print("   FINAL OPTIMIZATION SUMMARY ACROSS ALL THRESHOLDS   ")
 print("="*80)
 summary_df = pd.DataFrame(optimal_ratios)
 print(summary_df.to_string(index=False))
+
+# Export the master raw data to a single CSV file
+master_df = pd.DataFrame(master_raw_data)
+csv_filename = "Master_Optimization_Data_All_Years.csv"
+master_df.to_csv(csv_filename, index=False)
+print(f"\n[!] All raw sliding-scale optimization data successfully exported to {csv_filename}")
 
 # ==========================================
 # 6. FINAL SURVIVAL TABLE DATA
@@ -319,3 +352,27 @@ print("="*80)
 for yrs, kmf in kmf_aggressive_dict.items():
     final_survival = kmf.survival_function_.iloc[-1, 0] * 100
     print(f"{yrs}-Year Aggressive Cohort Final Survival: {final_survival:.1f}%")
+
+# ==========================================
+# EXACT COHORT SIZES FOR LATEX TABLE
+# ==========================================
+print("\n" + "="*80)
+print(" EXACT COHORT DISTRIBUTIONS FOR LATEX TABLE ")
+print("="*80)
+
+#Cohort Definitions:
+for yrs in [5, 6, 7, 8, 9, 10]:
+    thresh_mos = yrs * 12
+    
+    # Calculate exact sizes from df_base
+    agg_len = len(df_base[(df_base['COD to site recode'] == 'Breast') & (df_base['Survival months'] < thresh_mos)])
+    ind_len = len(df_base[(df_base['COD to site recode'] != 'Breast') & (df_base['Survival months'] >= thresh_mos)])
+    tot_len = agg_len + ind_len
+    
+    agg_pct = (agg_len / tot_len) * 100
+    ind_pct = (ind_len / tot_len) * 100
+    
+    print(f"{yrs}-Year Threshold:")
+    print(f"Total: {tot_len:,}")
+    print(f"  • Aggressive: {agg_len:,} ({agg_pct:.1f}%)")
+    print(f"  • Indolent:   {ind_len:,} ({ind_pct:.1f}%)\n")

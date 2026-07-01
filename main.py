@@ -204,6 +204,13 @@ for yrs in thresholds_yrs:
     random_search = RandomizedSearchCV(xgb_base, param_distributions=param_distributions, n_iter=20, scoring='f1', cv=5, random_state=42, n_jobs=-1)
     random_search.fit(X_train, y_train)
     best_xgb = random_search.best_estimator_
+
+    # --- EXTRACT STABILITY METRICS (CROSS-VALIDATION VARIANCE) ---
+    best_idx = random_search.best_index_
+    cv_mean = random_search.cv_results_['mean_test_score'][best_idx]
+    cv_std = random_search.cv_results_['std_test_score'][best_idx]
+    print(f"[*] CV Stability - Mean F1: {cv_mean:.4f} | Std Dev: +/- {cv_std:.4f}")
+
     y_probs = best_xgb.predict_proba(X_test)[:, 1]
 
     # ---------------------------------------------------------
